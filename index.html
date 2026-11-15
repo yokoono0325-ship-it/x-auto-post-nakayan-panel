@@ -220,10 +220,11 @@ nav.tabs button[aria-selected="true"] { color: var(--primary); }
       <p class="hint">@のあとの英数字</p>
       <input id="set-handle" autocomplete="off" autocapitalize="off" spellcheck="false">
       <label for="set-persona">あなたの立場</label>
-      <input id="set-persona">
+      <input id="set-persona" maxlength="500">
       <label for="set-audience">届けたい相手</label>
-      <input id="set-audience">
+      <input id="set-audience" maxlength="500">
       <label for="set-themes">発信テーマ（1行に1つ）</label>
+      <p class="hint">AIエージェント・Claude Code・経費削減から選び、1行に1つ入力してください。順番や組み合わせは変更できます。ほかのテーマの追加には運用側の設定変更が必要です。</p>
       <textarea id="set-themes"></textarea>
     </div>
 
@@ -793,6 +794,9 @@ function validateSettings(f) {
   if (f.handle.toLowerCase() !== "csd_naka") errors.push("なかやん専用のアカウント名 csd_naka を使ってください。");
   if (!/^[A-Za-z0-9_]{1,15}$/.test(f.handle)) errors.push("X のアカウント名は、英数字と _ の15文字以内で入れてください。");
   if (!f.themes.length) errors.push("発信テーマを1つ以上入れてください。");
+  if (f.themes.some((t) => !["AIエージェント", "Claude Code", "経費削減"].includes(t))) errors.push("発信テーマは AIエージェント・Claude Code・経費削減から選んでください。");
+  if (Array.from(f.persona).length > 500) errors.push("あなたの立場は500文字以内で入れてください。");
+  if (Array.from(f.audience).length > 500) errors.push("届けたい相手は500文字以内で入れてください。");
   return errors;
 }
 $("settings-save").addEventListener("click", async () => {
