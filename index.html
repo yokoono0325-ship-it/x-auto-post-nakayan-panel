@@ -234,6 +234,21 @@ nav.tabs button[aria-selected="true"] { color: var(--primary); }
       <textarea id="set-themes"></textarea>
     </div>
 
+    <h2>過去の投稿を参考にする</h2>
+    <div class="card">
+      <label for="style-references">自分の過去の投稿（手動で貼り付け）</label>
+      <p id="references-help" class="hint">まずは自分の投稿を3〜10件。投稿の間に空行を入れてください。口調や構成だけの参考に使い、事実の根拠や再投稿には使いません。</p>
+      <p class="hint">APIキー・パスワード・顧客の非公開情報は入れないでください。保存先は接続した非公開リポジトリです。今後の Claude 下書き生成時に、この文章を Anthropic に送信します。</p>
+      <textarea id="style-references" rows="10" autocomplete="off" spellcheck="false" aria-describedby="references-help references-count references-status" disabled></textarea>
+      <div id="references-count" class="counter">0／6000文字</div>
+      <p class="hint">最大6000文字（Unicodeコードポイント）。空欄で保存すると参考文を消せますが、以前の文章は Git の履歴に残ります。未保存の編集は画面内の再読み込みでは保持します。ページを閉じる・更新する前に保存してください。</p>
+      <div id="references-status" class="notice info" role="status" aria-live="polite">接続後に読み込みます</div>
+      <div class="row">
+        <button id="references-save" type="button" class="primary" disabled>参考投稿だけ保存</button>
+        <button id="references-reload" type="button" disabled>参考投稿を読み直す</button>
+      </div>
+    </div>
+
     <h2>投稿の数と時間</h2>
     <div class="card">
       <label for="set-posts-per-day">1日の投稿の数</label>
@@ -476,6 +491,106 @@ async function control(action, id, text) {
   await runWorkflow("control.yml", { action, id: id || "", text: text || "" });
 }
 
+// ===== 参考投稿：接続ごとにメモリだけに保持（localStorageには保存しない） =====
+const REFERENCES_LIMIT = 6000;
+let referencesEpoch = 0;
+let references = {};
+function resetReferences() {
+  referencesEpoch++;
+  references = { loaded: false, busy: false, dirty: false, sha: null, message: "接続後に読み込みます" };
+  $("style-references").value = "";
+  renderReferences();
+}
+function renderReferences() {
+  const count = Array.from($("style-references").value).length;
+  $("references-count").textContent = count + "／" + REFERENCES_LIMIT + "文字";
+  $("references-count").classList.toggle("over", count > REFERENCES_LIMIT);
+  $("style-references").disabled = !state.conn || !references.loaded || references.busy;
+  $("references-save").disabled = !state.conn || !references.loaded || references.busy || count > REFERENCES_LIMIT;
+  $("references-reload").disabled = !state.conn || references.busy;
+  $("references-status").textContent = references.message;
+}
+function referencesCurrent(epoch, conn) { return epoch === referencesEpoch && conn === state.conn; }
+async function verifyReferencesPrivate(epoch, conn) {
+  const repo = await api("GET", "");
+  if (!referencesCurrent(epoch, conn)) throw new Error("接続が変わりました");
+  if (repo.private !== true) throw new Error("非公開リポジトリと確認できないため、参考投稿の読み書きを停止しました");
+}
+async function loadReferences(explicit = false) {
+  if (!state.conn || references.busy || (references.dirty && !explicit)) return;
+  if (explicit && references.dirty && !window.confirm("編集した文章はそのまま残し、GitHub の最新版を保存の基準に読み直します。次の保存では最新版をこの文章で置き換えます。続けますか？")) return;
+  const epoch = referencesEpoch, conn = state.conn;
+  const keepInput = references.dirty;
+  references.busy = true;
+  references.message = "非公開の保存先を確認して読み込み中…";
+  renderReferences();
+  try {
+    await verifyReferencesPrivate(epoch, conn);
+    let text = "", sha = null;
+    try {
+      const file = await api("GET", "/contents/style_references.json");
+      if (!referencesCurrent(epoch, conn)) return;
+      if (file.type !== "file" || typeof file.content !== "string" || !file.sha || file.encoding !== "base64") throw new Error("参考投稿のファイルを確認できません");
+      const data = JSON.parse(decodeBase64(file.content));
+      if (!data || data.version !== 1 || typeof data.text !== "string") throw new Error("参考投稿の形式を確認できません");
+      text = data.text;
+      sha = file.sha;
+    } catch (e) {
+      if (e.status !== 404) throw e;
+    }
+    if (!referencesCurrent(epoch, conn)) return;
+    references.sha = sha;
+    references.loaded = true;
+    if (!keepInput) $("style-references").value = text;
+    references.message = keepInput ? "最新版を確認しました。編集中の文章は保持しています。内容を確認して保存してください。" : "読み込み済み。参考投稿は設定と別に保存します。";
+  } catch (e) {
+    if (!referencesCurrent(epoch, conn)) return;
+    references.loaded = false; // 読み込み失敗を空ファイル扱いしない
+    references.message = "読み込みを停止しました。入力は保持しています。「参考投稿を読み直す」で再試行してください。" + e.message;
+  } finally {
+    if (referencesCurrent(epoch, conn)) { references.busy = false; renderReferences(); }
+  }
+}
+$("style-references").addEventListener("input", () => {
+  references.dirty = true;
+  references.message = "未保存の変更があります";
+  renderReferences();
+});
+$("references-reload").addEventListener("click", () => loadReferences(true));
+$("references-save").addEventListener("click", async () => {
+  if (!state.conn || !references.loaded || references.busy) return;
+  const text = $("style-references").value;
+  if (Array.from(text).length > REFERENCES_LIMIT) { toast("6000文字以内にしてください。文章は切り詰めていません。", true); return; }
+  const epoch = referencesEpoch, conn = state.conn;
+  references.busy = true;
+  renderReferences();
+  try {
+    const message = "参考投稿を非公開リポジトリ " + conn.owner + "/" + conn.repo + " の style_references.json に保存しますか？\n今後の Claude 下書き生成時に、参考文を Anthropic に送信します。\n" + (text.trim() ? "口調・構成の参考だけに使います。" : "空欄で保存し、参考文を消します。以前の文章は Git の履歴に残ります。");
+    if (!window.confirm(message)) return;
+    await verifyReferencesPrivate(epoch, conn);
+    const body = { message: "操作画面から参考投稿を変更", content: encodeBase64(JSON.stringify({ version: 1, text }, null, 2) + "\n") };
+    if (references.sha) body.sha = references.sha;
+    const result = await api("PUT", "/contents/style_references.json", body);
+    if (!referencesCurrent(epoch, conn)) return;
+    if (!result || !result.content || !result.content.sha) throw new Error("保存結果を確認できません。読み直して確認してください。");
+    references.sha = result.content.sha;
+    references.dirty = false;
+    references.message = "参考投稿を保存しました。設定や投稿スケジュールは変更していません。";
+    toast("参考投稿を保存しました");
+  } catch (e) {
+    if (!referencesCurrent(epoch, conn)) return;
+    references.loaded = false; // 不確かな保存結果・競合は明示的な再読み込みまで再送しない
+    references.dirty = true;
+    references.message = (e.status === 409 || e.status === 422 ? "ほかの変更と競合しました。" : "保存を確認できませんでした。") + "入力は保持しています。「参考投稿を読み直す」で確認してから保存してください。" + e.message;
+  } finally {
+    if (referencesCurrent(epoch, conn)) { references.busy = false; renderReferences(); }
+  }
+});
+window.addEventListener("beforeunload", (ev) => {
+  if (references.dirty) { ev.preventDefault(); ev.returnValue = ""; }
+});
+resetReferences();
+
 // ===== データの読み込み =====
 function parseNeta(text) {
   const out = { unused: [], used: [] };
@@ -493,6 +608,7 @@ function parseNeta(text) {
 
 let loading = false;
 async function loadAll() {
+  if (state.conn) void loadReferences();
   if (!state.conn || loading) return false;
   loading = true;
   let ok = true;
@@ -970,6 +1086,7 @@ $("conn-save").addEventListener("click", async () => {
   b.disabled = true;
   const before = state.conn;
   state.conn = conn;
+  resetReferences();
   state.defaultBranch = null;
   try {
     await readSettings();   // まず settings.json を読めるか確かめる
@@ -981,6 +1098,8 @@ $("conn-save").addEventListener("click", async () => {
     await loadAll();
   } catch (e) {
     state.conn = before;
+    resetReferences();
+    if (state.conn) void loadReferences();
     $("conn-status").textContent = "接続できませんでした（" + (e.status ? "エラー " + e.status + "：" : "") + e.message + "）";
   }
   b.disabled = false;
@@ -990,6 +1109,7 @@ $("conn-clear").addEventListener("click", () => {
   ["conn-owner", "conn-repo", "conn-token"].forEach((id) => { $(id).value = ""; });
   $("conn-status").textContent = "";
   state.conn = null;
+  resetReferences();
   state.settings = null;
   state.queue = []; state.history = []; state.neta = { unused: [], used: [] }; state.runs = [];
   state.defaultBranch = null;
